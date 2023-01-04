@@ -76,6 +76,7 @@ use std::{
         self,
         FromStr,
     },
+    time::Duration,
 };
 use types::{
     TransactionResponse,
@@ -99,24 +100,117 @@ use self::schema::{
 pub mod schema;
 pub mod types;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// configuration for hyper/reqwest http client
+#[derive(Debug, Clone)]
+pub struct FuelClientConfig {
+    proxy_url: Option<String>,
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    pool_idle_timeout: Option<Duration>,
+    pool_max_idle_per_host: Option<usize>,
+}
+
+impl Default for FuelClientConfig {
+    fn default() -> Self {
+        Self {
+            proxy_url: None,
+            timeout: None,
+            connect_timeout: None,
+            pool_idle_timeout: Some(Duration::from_secs(90)),
+            pool_max_idle_per_host: None,
+        }
+    }
+}
+
+impl FuelClientConfig {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Set an HTTP proxy to use for requests
+    pub fn with_proxy_url(mut self, proxy_url: impl Into<String>) -> Self {
+        self.proxy_url = Some(proxy_url.into());
+        self
+    }
+
+    /// Enables a request timeout.
+    ///
+    /// The timeout is applied from when the request starts connecting until the
+    /// response body has finished.
+    ///
+    /// Default is no timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set a timeout for only the connect phase of a `Client`.
+    ///
+    /// Default is `None`.
+    ///
+    /// # Note
+    ///
+    /// This **requires** the futures be executed in a tokio runtime with
+    /// a tokio timer enabled.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set an optional timeout for idle sockets being kept-alive.
+    ///
+    /// Pass `None` to disable timeout.
+    ///
+    /// Default is 90 seconds.
+    pub fn with_pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.pool_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the maximum number of idle connections per host
+    ///
+    /// Default is no limit
+    pub fn with_pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.pool_max_idle_per_host = Some(max);
+        self
+    }
+
+    pub(crate) fn client(&self) -> anyhow::Result<reqwest::Client> {
+        let mut builder = reqwest::ClientBuilder::new();
+        if let Some(proxy) = &self.proxy_url {
+            let proxy = reqwest::Proxy::all(proxy)?;
+            builder = builder.proxy(proxy);
+        }
+
+        if let Some(timeout) = self.timeout {
+            builder = builder.timeout(timeout)
+        }
+
+        if let Some(connect_timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(connect_timeout)
+        }
+
+        builder = builder.pool_idle_timeout(self.pool_idle_timeout);
+
+        if let Some(max) = self.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(max)
+        }
+
+        Ok(builder.build()?)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FuelClient {
     url: reqwest::Url,
+    client: reqwest::Client,
 }
 
 impl FromStr for FuelClient {
     type Err = anyhow::Error;
 
     fn from_str(str: &str) -> Result<Self, Self::Err> {
-        let mut raw_url = str.to_string();
-        if !raw_url.starts_with("http") {
-            raw_url = format!("http://{}", raw_url);
-        }
-
-        let mut url = reqwest::Url::parse(&raw_url)
-            .with_context(|| format!("Invalid fuel-core URL: {}", str))?;
-        url.set_path("/graphql");
-        Ok(Self { url })
+        Self::new(str)
     }
 }
 
@@ -145,7 +239,27 @@ pub fn from_strings_errors_to_std_error(errors: Vec<String>) -> io::Error {
 
 impl FuelClient {
     pub fn new(url: impl AsRef<str>) -> anyhow::Result<Self> {
-        Self::from_str(url.as_ref())
+        let config = FuelClientConfig::default();
+        Self::new_with_config(url, config)
+    }
+
+    pub fn new_with_config(
+        url: impl AsRef<str>,
+        config: FuelClientConfig,
+    ) -> anyhow::Result<Self> {
+        let mut raw_url = String::from(url.as_ref());
+        if !raw_url.starts_with("http") {
+            raw_url = format!("http://{}", url.as_ref());
+        }
+        let mut client_url = reqwest::Url::parse(&raw_url)
+            .with_context(|| format!("Invalid fuel-core URL: {}", raw_url))?;
+        client_url.set_path("/graphql");
+
+        let client = config.client()?;
+        Ok(Self {
+            url: client_url,
+            client,
+        })
     }
 
     async fn query<ResponseData, Vars>(
@@ -156,7 +270,8 @@ impl FuelClient {
         Vars: serde::Serialize,
         ResponseData: serde::de::DeserializeOwned + 'static,
     {
-        let response = reqwest::Client::new()
+        let client = self.client.clone();
+        let response = client
             .post(self.url.clone())
             .run_graphql(q)
             .await
