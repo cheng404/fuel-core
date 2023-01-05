@@ -100,10 +100,10 @@ use self::schema::{
 pub mod schema;
 pub mod types;
 
-/// configuration for hyper/reqwest http client
+/// configuration for reqwest http client
+/// not work for `FuelClient::subscribe`, as it uses `eventsource_client`
 #[derive(Debug, Clone)]
 pub struct FuelClientConfig {
-    proxy_url: Option<String>,
     timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     pool_idle_timeout: Option<Duration>,
@@ -113,7 +113,6 @@ pub struct FuelClientConfig {
 impl Default for FuelClientConfig {
     fn default() -> Self {
         Self {
-            proxy_url: None,
             timeout: None,
             connect_timeout: None,
             pool_idle_timeout: Some(Duration::from_secs(90)),
@@ -125,12 +124,6 @@ impl Default for FuelClientConfig {
 impl FuelClientConfig {
     pub fn new() -> Self {
         Default::default()
-    }
-
-    /// Set an HTTP proxy to use for requests
-    pub fn with_proxy_url(mut self, proxy_url: impl Into<String>) -> Self {
-        self.proxy_url = Some(proxy_url.into());
-        self
     }
 
     /// Enables a request timeout.
@@ -162,8 +155,8 @@ impl FuelClientConfig {
     /// Pass `None` to disable timeout.
     ///
     /// Default is 90 seconds.
-    pub fn with_pool_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.pool_idle_timeout = Some(timeout);
+    pub fn with_pool_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.pool_idle_timeout = timeout;
         self
     }
 
@@ -177,10 +170,6 @@ impl FuelClientConfig {
 
     pub(crate) fn client(&self) -> anyhow::Result<reqwest::Client> {
         let mut builder = reqwest::ClientBuilder::new();
-        if let Some(proxy) = &self.proxy_url {
-            let proxy = reqwest::Proxy::all(proxy)?;
-            builder = builder.proxy(proxy);
-        }
 
         if let Some(timeout) = self.timeout {
             builder = builder.timeout(timeout)
